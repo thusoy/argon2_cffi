@@ -30,6 +30,8 @@ ENCODED_HASH_RE = re.compile(r'^\$' + r'\$'.join([
 
 class PasswordHasher(object):
 
+    ARGON2_FLAGS = lib.ARGON2_FLAG_CLEAR_PASSWORD | lib.ARGON2_FLAG_CLEAR_SECRET
+
     def __init__(self,
         version=ARGON2_VERSION,
         secret=None,
@@ -78,7 +80,7 @@ class PasswordHasher(object):
                 m_cost=self.m_cost,
                 lanes=self.parallelism, threads=self.parallelism,
                 allocate_cbk=ffi.NULL, free_cbk=ffi.NULL,
-                flags=lib.ARGON2_DEFAULT_FLAGS,
+                flags=self.ARGON2_FLAGS,
             )
         )
         result = core(ctx, Type.I.value)
@@ -129,7 +131,7 @@ class PasswordHasher(object):
                 m_cost=m_cost,
                 lanes=parallelism, threads=parallelism,
                 allocate_cbk=ffi.NULL, free_cbk=ffi.NULL,
-                flags=lib.ARGON2_DEFAULT_FLAGS,
+                flags=self.ARGON2_FLAGS,
             )
         )
         result = lib.argon2i_verify_ctx(ctx, raw_hash)
