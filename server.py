@@ -33,6 +33,7 @@ class PasswordHasher(object):
     def __init__(self,
         version=ARGON2_VERSION,
         secret=None,
+        secrets=None, # An iterable of (keyid, key) tuples. The first key is used for new hashes.
         time_cost=DEFAULT_TIME_COST,
         memory_cost=DEFAULT_MEMORY_COST,
         parallelism=DEFAULT_PARALLELISM,
@@ -48,6 +49,17 @@ class PasswordHasher(object):
         self.salt_len = salt_len
         self.csecret = ffi.new("uint8_t[]", secret) if secret is not None else ffi.NULL
         self.secret_len = len(secret) if secret else 0
+        if secrets:
+            self.secret_map = dict(secrets)
+            self.keyid = secrets[0][0]
+            self.data = ffi.new("uint8_t[]", self.keyid)
+            self.data_len = len(self.keyid)
+            secret = secrets[0][1]
+            self.csecret = ffi.new("uint8_t[]", secret)
+            self.secret_len = len(secret)
+        else:
+            self.data = ffi.FULL
+            self.data_len = 0
 
 
     def hash(self, password):
@@ -61,7 +73,7 @@ class PasswordHasher(object):
                 pwd=cpwd, pwdlen=len(password),
                 salt=csalt, saltlen=self.salt_len,
                 secret=self.csecret, secretlen=self.secret_len,
-                ad=ffi.NULL, adlen=0,
+                ad=self.data, adlen=self.data_len,
                 t_cost=self.t_cost,
                 m_cost=self.m_cost,
                 lanes=self.parallelism, threads=self.parallelism,
@@ -91,13 +103,28 @@ class PasswordHasher(object):
         t_cost = int(match.group('t_cost'))
         m_cost = int(match.group('m_cost'))
         parallelism = int(match.group('parallelism'))
+
+        keyid = match.group('keyid')
+        if keyid:
+            secret = self.secret_map.get(keyid)
+            assert secret, 'No key for keyid %s' % keyid
+            csecret = ffi.new("uint8_t[]", secret)
+            secret_len = len(secret)
+            cdata = ffi.new("uint8_t[]", keyid)
+            data_len = len(keyid)
+        else:
+            csecret = self.csecret
+            secret_len = self.secret_len
+            cdata = ffi.NULL
+            data_len = 0
+
         ctx = ffi.new("argon2_context *", dict(
                 version=ARGON2_VERSION,
                 out=cout, outlen=len(raw_hash),
                 pwd=cpwd, pwdlen=len(password),
                 salt=csalt, saltlen=len(salt),
-                secret=self.csecret, secretlen=self.secret_len,
-                ad=ffi.NULL, adlen=0,
+                secret=csecret, secretlen=secret_len,
+                ad=cdata, adlen=data_len,
                 t_cost=t_cost,
                 m_cost=m_cost,
                 lanes=parallelism, threads=parallelism,
@@ -111,7 +138,7 @@ class PasswordHasher(object):
 
 
     def _encode(self, raw_hash, salt):
-        return '${algo}$v={version}$m={m_cost},t={t_cost},p={parallelism}${salt}${hash}'.format(
+        format_args = dict(
             algo='argon2i',
             t_cost=self.t_cost,
             m_cost=self.m_cost,
@@ -119,17 +146,29 @@ class PasswordHasher(object):
             salt=base64.b64encode(salt).rstrip('='),
             hash=base64.b64encode(raw_hash).rstrip('='),
             version=self.version,
+            keyid='',
         )
+        if self.data:
+            format_args['keyid'] = ',keyid={}'.format(self.keyid)
+        return ('${algo}$v={version}$m={m_cost},t={t_cost},p={parallelism}{keyid}'
+            '${salt}${hash}').format(**format_args)
+
 
 def _b64_decode_raw(encoded):
     '''Decode basse64 string without padding'''
     return base64.b64decode(encoded + (b'='*((4 - len(encoded) % 4) % 4)))
 
 
-secret = b'supersecret'
+secret = 'supersecret'
+secrets = [
+    ('key1', 'actualsecretkey'),
+    ('key2', 'othersecretkey'),
+]
 
-ph = PasswordHasher(secret=secret)
+ph = PasswordHasher(secrets=secrets)
 
 hashed = ph.hash('mypassword')
 print(hashed)
 print(ph.verify(hashed, 'mypassword'))
+key2_hash = '$argon2i$v=19$m=512,t=2,p=2,keyid=key2$bSzaaXG0CVe3xPP7cykaSw$cZIoIsf7YI2Fdtv1v2hVvn+1oTuM1g0LIbCsPeU0v8c'
+print(ph.verify(key2_hash, 'mypassword'))
