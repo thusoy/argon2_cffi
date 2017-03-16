@@ -179,6 +179,7 @@ uint32_t argon2_encodedlen(uint32_t t_cost, uint32_t m_cost,
                            uint32_t parallelism, uint32_t saltlen,
                            uint32_t hashlen, argon2_type type);
 
+int argon2i_verify_ctx(argon2_context *context, const char *hash);
 """)
 
 if __name__ == '__main__':
