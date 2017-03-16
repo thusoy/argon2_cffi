@@ -1,6 +1,7 @@
 #!./venv/bin/python
 
 import os
+import contextlib
 import base64
 import re
 
@@ -13,6 +14,7 @@ DEFAULT_SALT_LENGTH = 16
 DEFAULT_HASH_LENGTH = 32
 DEFAULT_TIME_COST = 2
 DEFAULT_MEMORY_COST = 512
+DEFAULT_FLAGS = lib.ARGON2_FLAG_CLEAR_PASSWORD | lib.ARGON2_FLAG_CLEAR_SECRET
 DEFAULT_PARALLELISM = 2
 # This regex validats the spec from
 # https://github.com/P-H-C/phc-string-format/blob/master/phc-sf-spec.md
@@ -49,8 +51,10 @@ class PasswordHasher(object):
         self.parallelism = parallelism
         self.hash_len = hash_len
         self.salt_len = salt_len
-        self.csecret = ffi.new("uint8_t[]", secret) if secret is not None else ffi.NULL
-        self.secret_len = len(secret) if secret else 0
+
+        if secret:
+            assert secrets is None, 'Can only specify either secret or secrets'
+            secrets = [secret]
         if secrets:
             self.secret_map = dict(secrets)
             self.keyid = secrets[0][0]
@@ -60,8 +64,10 @@ class PasswordHasher(object):
             self.csecret = ffi.new("uint8_t[]", secret)
             self.secret_len = len(secret)
         else:
-            self.data = ffi.FULL
+            self.data = ffi.NULL
             self.data_len = 0
+            self.csecret = ffi.NULL
+            self.secret_len = 0
 
 
     def hash(self, password):
@@ -97,44 +103,30 @@ class PasswordHasher(object):
         assert match, 'Hashed string is on unknown format'
         version = int(match.group('version'))
         assert version == ARGON2_VERSION, 'Unknown version of hashed password'
-        cout = ffi.new("uint8_t[]", self.hash_len)
-        cpwd = ffi.new("uint8_t[]", password.encode('utf-8'))
         salt = _b64_decode_raw(match.group('salt'))
         raw_hash = _b64_decode_raw(match.group('hash'))
-        csalt = ffi.new("uint8_t[]", salt)
         t_cost = int(match.group('t_cost'))
         m_cost = int(match.group('m_cost'))
         parallelism = int(match.group('parallelism'))
+
+        context_params = dict(
+            time_cost=t_cost,
+            memory_cost=m_cost,
+            parallelism=parallelism,
+            salt=salt,
+            password=password,
+        )
 
         keyid = match.group('keyid')
         if keyid:
             secret = self.secret_map.get(keyid)
             assert secret, 'No key for keyid %s' % keyid
-            csecret = ffi.new("uint8_t[]", secret)
-            secret_len = len(secret)
-            cdata = ffi.new("uint8_t[]", keyid)
-            data_len = len(keyid)
-        else:
-            csecret = self.csecret
-            secret_len = self.secret_len
-            cdata = ffi.NULL
-            data_len = 0
+            context_params['secret'] = secret
+            context_params['data'] = keyid
 
-        ctx = ffi.new("argon2_context *", dict(
-                version=ARGON2_VERSION,
-                out=cout, outlen=len(raw_hash),
-                pwd=cpwd, pwdlen=len(password),
-                salt=csalt, saltlen=len(salt),
-                secret=csecret, secretlen=secret_len,
-                ad=cdata, adlen=data_len,
-                t_cost=t_cost,
-                m_cost=m_cost,
-                lanes=parallelism, threads=parallelism,
-                allocate_cbk=ffi.NULL, free_cbk=ffi.NULL,
-                flags=self.ARGON2_FLAGS,
-            )
-        )
-        result = lib.argon2i_verify_ctx(ctx, raw_hash)
+        with argon2_context(**context_params) as ctx:
+            result = lib.argon2i_verify_ctx(ctx, raw_hash)
+
         if result != lib.ARGON2_OK:
             raise VerifyMismatchError()
 
@@ -161,7 +153,51 @@ def _b64_decode_raw(encoded):
     return base64.b64decode(encoded + (b'='*((4 - len(encoded) % 4) % 4)))
 
 
-secret = 'supersecret'
+@contextlib.contextmanager
+def argon2_context(
+        password=None,
+        salt=None,
+        secret=None,
+        data=None,
+        hash_len=DEFAULT_HASH_LENGTH,
+        time_cost=DEFAULT_TIME_COST,
+        memory_cost=DEFAULT_MEMORY_COST,
+        parallelism=DEFAULT_PARALLELISM,
+        flags=DEFAULT_FLAGS,
+        ):
+    csalt = ffi.new("uint8_t[]", salt)
+    cout = ffi.new("uint8_t[]", hash_len)
+    cpwd = ffi.new("uint8_t[]", password.encode('utf-8'))
+    if secret:
+        csecret = ffi.new("uint8_t[]", secret)
+        secret_len = len(secret)
+    else:
+        csecret = ffi.NULL
+        secret_len = 0
+    if data:
+        cdata = ffi.new("uint8_t[]", data)
+        data_len = len(data)
+    else:
+        cdata = ffi.NULL
+        data_len = 0
+    ctx = ffi.new("argon2_context *", dict(
+            version=ARGON2_VERSION,
+            out=cout, outlen=hash_len,
+            pwd=cpwd, pwdlen=len(password),
+            salt=csalt, saltlen=len(salt),
+            secret=csecret, secretlen=secret_len,
+            ad=cdata, adlen=data_len,
+            t_cost=time_cost,
+            m_cost=memory_cost,
+            lanes=parallelism, threads=parallelism,
+            allocate_cbk=ffi.NULL, free_cbk=ffi.NULL,
+            flags=DEFAULT_FLAGS,
+        )
+    )
+    yield ctx
+
+
+secret = ('1', 'supersecret')
 secrets = [
     ('key1', 'actualsecretkey'),
     ('key2', 'othersecretkey'),
