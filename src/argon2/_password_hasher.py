@@ -1,10 +1,19 @@
 from __future__ import absolute_import, division, print_function
 
-import os
 
+import base64
+import contextlib
+import os
+import re
+
+from .exceptions import VerifyMismatchError
 from .low_level import (
+    ARGON2_VERSION,
     Type,
+    core,
+    ffi,
     hash_secret,
+    lib,
     verify_secret,
 )
 from ._utils import _check_types
@@ -15,6 +24,25 @@ DEFAULT_HASH_LENGTH = 16
 DEFAULT_TIME_COST = 2
 DEFAULT_MEMORY_COST = 512
 DEFAULT_PARALLELISM = 2
+DEFAULT_FLAGS = lib.ARGON2_FLAG_CLEAR_PASSWORD | lib.ARGON2_FLAG_CLEAR_SECRET
+
+# This regex validats the spec from
+# https://github.com/P-H-C/phc-string-format/blob/master/phc-sf-spec.md
+ENCODED_HASH_RE = re.compile(r''.join([
+    # TODO: Validate max lengths of fields
+        r'^\$argon2i\$',
+        r'(?:v=(?P<version>[0-9]+)\$)?',
+        r''.join([
+            r'm=(?P<memory_cost>[0-9]{1,10})',
+            r',t=(?P<time_cost>[0-9]{1,10})',
+            r',p=(?P<parallelism>[0-9]{1,3})',
+            r'(?:,keyid=(?P<keyid>[a-zA-Z0-9+/]+))?', # optional
+            r'(?:,data=(?P<data>[a-zA-Z0-9+/]+))?', # optional, unused
+        ]),
+        r'\$(?P<salt>[a-zA-Z0-9+/]+)\$',
+        r'(?P<hash>[a-zA-Z0-9+/]+)',
+    ]) + r'$'
+)
 
 
 def _ensure_bytes(s, encoding):
@@ -47,6 +75,9 @@ class PasswordHasher(object):
     :param str encoding: The Argon2 C library expects bytes.  So if
         :meth:`hash` or :meth:`verify` are passed an unicode string, it will be
         encoded using this encoding.
+    :param list secrets: A list of (keyid, key) tuples that will be used for
+        keyed hashing. The first element in the list will be used for new
+        hashes, the others to verify old ones.
 
     .. versionadded:: 16.0.0
 
@@ -55,7 +86,7 @@ class PasswordHasher(object):
     """
     __slots__ = [
         "time_cost", "memory_cost", "parallelism", "hash_len", "salt_len",
-        "encoding",
+        "encoding", "secret_map", "secret", "keyid"
     ]
 
     def __init__(
@@ -66,6 +97,7 @@ class PasswordHasher(object):
         hash_len=DEFAULT_HASH_LENGTH,
         salt_len=DEFAULT_RANDOM_SALT_LENGTH,
         encoding="utf-8",
+        secrets=None,
     ):
         e = _check_types(
             time_cost=(time_cost, int),
@@ -84,6 +116,16 @@ class PasswordHasher(object):
         self.salt_len = salt_len
         self.encoding = encoding
 
+        if secrets:
+            self.secret_map = dict(secrets)
+            self.secret = secrets[0][1]
+            self.keyid = secrets[0][0]
+        else:
+            self.secret_map = {}
+            self.secret = None
+            self.keyid = None
+
+
     def hash(self, password):
         """
         Hash *password* and return an encoded hash.
@@ -95,15 +137,24 @@ class PasswordHasher(object):
 
         :rtype: unicode
         """
-        return hash_secret(
-            secret=_ensure_bytes(password, self.encoding),
-            salt=os.urandom(self.salt_len),
+        salt = os.urandom(self.salt_len)
+        context_params = dict(
+            salt=salt,
+            password=_ensure_bytes(password, self.encoding),
+            secret=_ensure_bytes(self.secret, self.encoding) if self.secret else None,
+            data=self.keyid,
             time_cost=self.time_cost,
             memory_cost=self.memory_cost,
             parallelism=self.parallelism,
             hash_len=self.hash_len,
-            type=Type.I,
-        ).decode("ascii")
+        )
+        with argon2_context(**context_params) as ctx:
+            result = core(ctx, Type.I.value)
+            assert result == lib.ARGON2_OK
+
+            raw_hash = bytes(ffi.buffer(ctx.out, ctx.outlen))
+        return self._encode(raw_hash, salt)
+
 
     def verify(self, hash, password):
         """
@@ -127,8 +178,107 @@ class PasswordHasher(object):
             Raise :exc:`~argon2.exceptions.VerifyMismatchError` on mismatches
             instead of its more generic superclass.
         """
-        return verify_secret(
-            _ensure_bytes(hash, "ascii"),
-            _ensure_bytes(password, self.encoding),
-            Type.I,
+        assert len(hash) < 1024 # Ensure we don't DDoS ourselves if the database holds corrupt values
+        # TODO: Ensure hashed values are maximum double of what we're configured with
+        # TODO: Test migrating parameters
+        match = ENCODED_HASH_RE.match(hash)
+        assert match, 'Hashed string is on unknown format: %s' % hash
+        version = match.group('version')
+        if version:
+            version = int(version)
+            assert version == ARGON2_VERSION, 'Unknown version of hashed password'
+        # without explicit versioning we can't know whether we're compatible
+
+        salt = _b64_decode_raw(match.group('salt'))
+        raw_hash = _b64_decode_raw(match.group('hash'))
+        time_cost = int(match.group('time_cost'))
+        memory_cost = int(match.group('memory_cost'))
+        parallelism = int(match.group('parallelism'))
+
+        context_params = dict(
+            time_cost=time_cost,
+            memory_cost=memory_cost,
+            parallelism=parallelism,
+            salt=salt,
+            password=password,
         )
+
+        keyid = match.group('keyid')
+        if keyid:
+            secret = self.secret_map.get(keyid)
+            assert secret, 'No key for keyid %s' % keyid
+            context_params['secret'] = secret
+            context_params['data'] = keyid
+
+        print('verifying with parameters %s' % context_params)
+        with argon2_context(**context_params) as ctx:
+            result = lib.argon2i_verify_ctx(ctx, raw_hash)
+
+        if result != lib.ARGON2_OK:
+            raise VerifyMismatchError()
+
+
+    def _encode(self, raw_hash, salt):
+        format_args = dict(
+            algo='argon2i',
+            t_cost=self.time_cost,
+            m_cost=self.memory_cost,
+            parallelism=self.parallelism,
+            salt=base64.b64encode(salt).rstrip('='),
+            hash=base64.b64encode(raw_hash).rstrip('='),
+            version=ARGON2_VERSION,
+            keyid='',
+        )
+        if self.keyid:
+            format_args['keyid'] = ',keyid={}'.format(self.keyid)
+        return (u'${algo}$v={version}$m={m_cost},t={t_cost},p={parallelism}{keyid}'
+            u'${salt}${hash}').format(**format_args)
+
+
+def _b64_decode_raw(encoded):
+    '''Decode basse64 string without padding'''
+    return base64.b64decode(encoded + (b'='*((4 - len(encoded) % 4) % 4)))
+
+
+@contextlib.contextmanager
+def argon2_context(
+        password=None, # bytes
+        salt=None,
+        secret=None,
+        data=None,
+        hash_len=DEFAULT_HASH_LENGTH,
+        time_cost=DEFAULT_TIME_COST,
+        memory_cost=DEFAULT_MEMORY_COST,
+        parallelism=DEFAULT_PARALLELISM,
+        flags=DEFAULT_FLAGS,
+        ):
+    csalt = ffi.new("uint8_t[]", salt)
+    cout = ffi.new("uint8_t[]", hash_len)
+    cpwd = ffi.new("uint8_t[]", password)
+    if secret:
+        csecret = ffi.new("uint8_t[]", secret)
+        secret_len = len(secret)
+    else:
+        csecret = ffi.NULL
+        secret_len = 0
+    if data:
+        cdata = ffi.new("uint8_t[]", data)
+        data_len = len(data)
+    else:
+        cdata = ffi.NULL
+        data_len = 0
+    ctx = ffi.new("argon2_context *", dict(
+            version=ARGON2_VERSION,
+            out=cout, outlen=hash_len,
+            pwd=cpwd, pwdlen=len(password),
+            salt=csalt, saltlen=len(salt),
+            secret=csecret, secretlen=secret_len,
+            ad=cdata, adlen=data_len,
+            t_cost=time_cost,
+            m_cost=memory_cost,
+            lanes=parallelism, threads=parallelism,
+            allocate_cbk=ffi.NULL, free_cbk=ffi.NULL,
+            flags=DEFAULT_FLAGS,
+        )
+    )
+    yield ctx
