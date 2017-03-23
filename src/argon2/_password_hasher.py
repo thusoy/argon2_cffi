@@ -201,7 +201,7 @@ class PasswordHasher(object):
             memory_cost=memory_cost,
             parallelism=parallelism,
             salt=salt,
-            password=password,
+            password=_ensure_bytes(password, self.encoding),
             version=version,
         )
 
