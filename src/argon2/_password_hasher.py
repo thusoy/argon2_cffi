@@ -186,8 +186,9 @@ class PasswordHasher(object):
         version = match.group('version')
         if version:
             version = int(version)
-            assert version == ARGON2_VERSION, 'Unknown version of hashed password'
-        # without explicit versioning we can't know whether we're compatible
+        else:
+            # Default to the old version as only ARGON2_VERSION_13 includes it in the encoded string
+            version = lib.ARGON2_VERSION_10
 
         salt = _b64_decode_raw(match.group('salt'))
         raw_hash = _b64_decode_raw(match.group('hash'))
@@ -201,6 +202,7 @@ class PasswordHasher(object):
             parallelism=parallelism,
             salt=salt,
             password=password,
+            version=version,
         )
 
         keyid = match.group('keyid')
@@ -251,6 +253,7 @@ def argon2_context(
         memory_cost=DEFAULT_MEMORY_COST,
         parallelism=DEFAULT_PARALLELISM,
         flags=DEFAULT_FLAGS,
+        version=ARGON2_VERSION,
         ):
     csalt = ffi.new("uint8_t[]", salt)
     cout = ffi.new("uint8_t[]", hash_len)
@@ -268,7 +271,7 @@ def argon2_context(
         cdata = ffi.NULL
         data_len = 0
     ctx = ffi.new("argon2_context *", dict(
-            version=ARGON2_VERSION,
+            version=version,
             out=cout, outlen=hash_len,
             pwd=cpwd, pwdlen=len(password),
             salt=csalt, saltlen=len(salt),
